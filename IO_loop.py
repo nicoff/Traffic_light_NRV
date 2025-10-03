@@ -2,6 +2,31 @@ import os, time, requests, logging
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+import RPi.GPIO as GPIO
+import atexit
+
+
+def cleanup_gpio():
+    GPIO.cleanup()
+atexit.register(cleanup_gpio)
+    
+GPIO.setmode(GPIO.BCM)  # Use BCM pin numbering
+
+LED_PINS = {
+    "blue": 23,
+    "green_pos": 22,
+    "green_neg": 27,
+    "yellow_pos": 17,
+    "yellow_neg": 24,
+    "red_pos": 5,
+    "red_neg": 6,
+}
+BUZZER_PIN = 18  
+GPIO.setup(BUZZER_PIN, GPIO.OUT)
+
+for pin in LED_PINS.values():
+    GPIO.setup(pin, GPIO.OUT)
+    GPIO.output(pin, GPIO.LOW)
 
 # --- config ---
 BERLIN = ZoneInfo("Europe/Berlin")
@@ -26,10 +51,45 @@ def iso_utc(ts: str) -> datetime:
 
 # --- hardware stubs (replace later) ---
 def led_ok(color: str):
-    print(f"[LED] {color} solid")
+    # Turn off all LEDs first
+    for pin in LED_PINS.values():
+        print(f"[LED] {color} solid")
+        GPIO.output(pin, GPIO.LOW)
+    
+    key = color.lower()
+    pin = LED_PINS.get(key)
+    if pin is not None:
+        GPIO.output(pin, GPIO.HIGH)
+    else:
+        print(f"Unknown LED color: {color}")
 
 def led_error_blink():
     print("[LED] ERROR: blink all")
+    for _ in range(5):
+        for pin in LED_PINS.values():
+            GPIO.output(pin, GPIO.HIGH)
+        time.sleep(0.5)
+        for pin in LED_PINS.values():
+            GPIO.output(pin, GPIO.LOW)
+        time.sleep(0.5)
+
+buzzer_pwm = GPIO.PWM(BUZZER_PIN, 440)  # Start with base freq
+
+def buzzer_up():
+    buzzer_pwm.start(50)  # 50% duty cycle
+    for freq in [600, 1000, 1]:
+        buzzer_pwm.ChangeFrequency(freq)
+        time.sleep(0.1)
+
+    buzzer_pwm.stop()
+
+def buzzer_down():
+    buzzer_pwm.start(50)
+    for freq in [1000, 600, 1]:
+        buzzer_pwm.ChangeFrequency(freq)
+        time.sleep(0.2)
+    buzzer_pwm.stop()
+
 
 def buzzer_ok():
     print("[BUZZER] ok tone")
@@ -67,6 +127,23 @@ def get_token(client_id: str, client_secret: str) -> str:
 
 # --- state output (map API value -> LED/buzzer) ---
 def apply_state(api_value: str):
+    if api_value == "BLUE":
+        led_ok("blue")
+    elif api_value == "GREEN_POS":
+        led_ok("green_pos")
+    elif api_value == "GREEN_NEG":
+        led_ok("green_neg")
+    elif api_value == "YELLOW_POS":
+        led_ok("yellow_pos")
+    elif api_value == "YELLOW_NEG":
+        led_ok("yellow_neg")
+    elif api_value == "RED_POS":
+        led_ok("red_pos")
+    elif api_value == "RED_NEG":
+        led_ok("red_neg")
+        
+'''
+def apply_state(api_value: str):
     v = VALUE_MAP[api_value]
     if v == 0:
         led_ok("blue");   #buzzer_ok()
@@ -82,6 +159,7 @@ def apply_state(api_value: str):
         led_ok("red");    #buzzer_ok()
     elif v == -3:
         led_ok("red");    #buzzer_ok()
+'''
 
 def failure_mode(reason: str):
     logging.error("Failure mode: %s", reason)
@@ -144,8 +222,11 @@ def main():
                 t_loc = latest_to.astimezone(BERLIN).strftime("%Y-%m-%d %H:%M:%S %Z")
                 logging.info("Initial state: %s → %s : %s", f_loc, t_loc, VALUE_MAP[latest["Value"]])
     except Exception as e:
+        print("Caught exception:", e)
         self_test_fail(); failure_mode(f"startup error: {e}"); in_failure = True
 
+    previous_value = -10
+    latest_value = 19  
     while True:
         try:
             rows, token = fetch_latest_rows(token, CLIENT_ID, CLIENT_SECRET)
@@ -161,9 +242,21 @@ def main():
                         failure_mode(f"unknown value: {val}"); in_failure = True
                 else:
                     latest_to = iso_utc(latest["To"])
+                        
                     if last_to is None or latest_to > last_to:
+                        numeric_val = VALUE_MAP.get(val)
+
+                        # Compare with previous value and chirp up/down
+                        if latest_value is not None and numeric_val is not None:
+                            if numeric_val > latest_value:
+                                buzzer_up()
+                            elif numeric_val < latest_value:
+                                buzzer_down()
+                            latest_value = numeric_val
+
                         last_to = latest_to
-                        apply_state(val)
+                        apply_state(val)                        
+                        
                         f_loc = iso_utc(latest["From"]).astimezone(BERLIN).strftime("%Y-%m-%d %H:%M:%S %Z")
                         t_loc = latest_to.astimezone(BERLIN).strftime("%Y-%m-%d %H:%M:%S %Z")
                         logging.info("%s → %s : %s", f_loc, t_loc, VALUE_MAP[val])
@@ -173,7 +266,7 @@ def main():
                             # skip the very first countdown
                             first_after_start = False
                         else:
-                            for sec in range(55, 0, -1):
+                            for sec in range(50, 0, -1):
                                 print(f"\rSleeping: {sec:02d}s", end="", flush=True)
                                 time.sleep(1)
                             print("\r", end="")  # clear line when done
@@ -188,11 +281,31 @@ def main():
                         in_failure = False
 
         except Exception as e:
-            if not in_failure:
-                failure_mode(str(e)); in_failure = True
+            print("caught exception here!")
+            for pin in LED_PINS.values():
+                GPIO.output(pin, GPIO.LOW)            
+            now = datetime.now(timezone.utc)
+            if last_to is not None and (now - last_to > STALE_AFTER):
+                if not in_failure:
+                    failure_mode(f"stale data during error handling ({now - last_to})")
+                    in_failure = True
+            else:
+                if not in_failure:
+                    failure_mode(str(e))
+                    in_failure = True
+                    
 
         time.sleep(POLL_INTERVAL_SEC)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        buzzer_up()
+        time.sleep(1)
+        buzzer_down()
+        main()
+    except KeyboardInterrupt:
+        print("Exiting cleanly...")
+        #buzzer_down()
+        GPIO.cleanup()
+        
